@@ -1,0 +1,42 @@
+[
+    {
+        "name": "Sales Analysis - Mean Sales",
+        "file": "test_sales.csv",
+        "query": "Calculate the average Sales",
+        "expected_function": "calculate",
+        "expected_args": {
+            "func": "mean",
+            "column": "Sales"
+        }
+    },
+    {
+        "name": "Sales Analysis - Filter Region",
+        "file": "test_sales.csv",
+        "query": "Filter for Region equals North",
+        "expected_function": "filter",
+        "expected_args": {
+            "column": "Region",
+            "value": "North"
+        }
+    },
+    {
+        "name": "Inventory Analysis - Sort Stock",
+        "file": "test_inventory.xlsx",
+        "query": "Sort by Stock in descending order",
+        "expected_function": "sort",
+        "expected_args": {
+            "column": "Stock",
+            "ascending": false
+        }
+    },
+    {
+        "name": "Inventory Analysis - Plot Price",
+        "file": "test_inventory.xlsx",
+        "query": "Plot a histogram of Price",
+        "expected_function": "plot",
+        "expected_args": {
+            "kind": "hist",
+            "x": "Price"
+        }
+    }
+]

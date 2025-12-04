@@ -70,9 +70,9 @@ if uploaded_file and (api_key or provider == "Local"):
         for message in st.session_state.messages:
             with st.chat_message(message["role"]):
                 st.markdown(message["content"])
-                if "code" in message:
-                    with st.expander("Show Code"):
-                        st.code(message["code"], language="python")
+                if "plan" in message:
+                    with st.expander("Show Plan"):
+                        st.json(message["plan"])
                 if "result" in message:
                     st.write("Result:")
                     st.write(message["result"])
@@ -90,29 +90,25 @@ if uploaded_file and (api_key or provider == "Local"):
                 
                 try:
                     # 1. Plan
-                    with st.status("Generating Plan...", expanded=False) as status:
-                        plan = agent.generate_plan(prompt)
-                        status.write(plan)
+                    with st.status("Generating JSON Plan...", expanded=False) as status:
+                        plan = agent.generate_json_plan(prompt)
+                        status.json(plan)
                         status.update(label="Plan Generated", state="complete")
                     
-                    # 2. Code
-                    with st.status("Generating Code...", expanded=False) as status:
-                        code = agent.generate_code(prompt, plan)
-                        status.code(code, language="python")
-                        status.update(label="Code Generated", state="complete")
-                    
-                    # 3. Execute
-                    with st.status("Executing Code...", expanded=False) as status:
-                        exec_result = agent.execute_code(code)
+                    # 2. Execute
+                    with st.status("Executing Plan...", expanded=False) as status:
+                        exec_result = agent.execute_json_plan(plan)
+                        
                         if exec_result["success"]:
+                            status.write("Execution Log:")
+                            status.table(pd.DataFrame(exec_result["log"]))
                             status.update(label="Execution Successful", state="complete")
                         else:
                             status.update(label="Execution Failed", state="error")
                             st.error(f"Error: {exec_result['error']}")
-                            st.code(exec_result['traceback'])
                             st.stop()
 
-                    # 4. Explain
+                    # 3. Explain
                     if exec_result["success"]:
                         final_response = agent.explain_result(prompt, exec_result)
                         message_placeholder.markdown(final_response)
@@ -129,7 +125,7 @@ if uploaded_file and (api_key or provider == "Local"):
                         st.session_state.messages.append({
                             "role": "assistant", 
                             "content": final_response,
-                            "code": code,
+                            "plan": plan,
                             "result": exec_result["result"],
                             "fig": exec_result["fig"]
                         })

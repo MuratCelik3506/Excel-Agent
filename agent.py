@@ -3,11 +3,13 @@ import os
 import io
 import sys
 import traceback
+import json
+import re
 
 class ExcelAgent:
     def __init__(self, dataframe: pd.DataFrame, api_key: str = None, provider: str = 'openai', model_name: str = None, base_url: str = None):
         self.df = dataframe
-        self.api_key = api_key or "dummy" # Local LLMs might not need a real key
+        self.api_key = api_key or "dummy"
         self.provider = provider.lower()
         self.model_name = model_name
         self.base_url = base_url
@@ -34,12 +36,11 @@ class ExcelAgent:
                 response = self.client.chat.completions.create(
                     model=self.model,
                     messages=[
-                        {"role": "system", "content": "You are a helpful data analysis assistant. You are given a pandas DataFrame named 'df'."},
+                        {"role": "system", "content": "You are a helpful data analysis assistant. You output ONLY valid JSON."},
                         {"role": "user", "content": prompt}
                     ],
                     temperature=0
                 )
-                print(response)
                 content = response.choices[0].message.content
                 if content is None:
                     return "Error: LLM returned no content."
@@ -53,129 +54,255 @@ class ExcelAgent:
             return f"Error calling LLM: {str(e)}"
         return "Error: Unknown provider or failed execution."
 
-    def generate_plan(self, user_query: str) -> str:
-        """Generates a natural language plan."""
+    def generate_json_plan(self, user_query: str) -> list:
+        """Generates a JSON plan for the query."""
         columns = ", ".join(self.df.columns.tolist())
         head = self.df.head(3).to_markdown()
-        
-        prompt = f"""
-        User Query: {user_query}
-        
-        Dataframe Context:
-        Columns: {columns}
-        Sample Data:
-        {head}
-        
-        Task: Explain step-by-step how you would solve this query using Pandas. 
-        Keep it concise and high-level. Do not write code yet.
-        """
-        return self._call_llm(prompt)
-
-    def generate_code(self, user_query: str, plan: str) -> str:
-        """Generates the Pandas code."""
-        columns = ", ".join(self.df.columns.tolist())
         dtypes = str(self.df.dtypes)
         
         prompt = f"""
-        You have a pandas DataFrame named `df`.
+        You are a data analyst. You have a pandas DataFrame named `df`.
         Columns: {columns}
         Data Types:
         {dtypes}
+        Sample Data:
+        {head}
         
         User Query: {user_query}
-        Plan: {plan}
         
-        Task: Write Python code to solve the query.
+        Task: Create a JSON plan to answer the query using the following supported functions:
         
-        Constraints:
-        1. The code must be valid Python.
-        2. Assume `df` is already loaded.
-        3. If the user asks for a plot, use matplotlib or seaborn and save the figure to a variable named `fig` if possible, or just `plt.show()`.
-        4. If the result is a number or dataframe, assign it to a variable named `result`.
-        5. RETURN ONLY THE CODE. No markdown backticks, no explanation.
+        1. `filter(dataframe, column, operator, value)`: Filter rows. Operators: ==, !=, >, <, >=, <=, contains.
+        2. `sort(dataframe, column, ascending)`: Sort rows. ascending is boolean.
+        3. `group_by(dataframe, by, agg_col, agg_func)`: Group by column 'by', and aggregate 'agg_col' using 'agg_func' (mean, sum, count, min, max).
+        4. `calculate(dataframe, column, func)`: Calculate on a column. func: mean, sum, min, max, count, unique, value_counts.
+        5. `select_columns(dataframe, columns)`: Select specific columns. 'columns' is a list of strings.
+        6. `head(dataframe, n)`: Get first n rows.
+        7. `plot(dataframe, x, y, kind, title)`: Plot data. kind: line, bar, scatter, hist, box.
+        
+        Output Format:
+        A JSON list of steps. Each step is an object:
+        {{
+            "id": 1,
+            "function": "function_name",
+            "args": {{ "arg_name": "arg_value", ... }},
+            "output": "variable_name_to_store_result"
+        }}
+        
+        Rules:
+        - The first step usually takes "df" as input in 'dataframe' arg.
+        - Subsequent steps can use the 'output' variable name of previous steps as input.
+        - The final result should be in a variable named "final_result".
+        - Do NOT write any text or markdown outside the JSON.
         """
         
         response = self._call_llm(prompt)
-        if not response or "Error:" in response:
-            return f"print('{response}')"
-            
-        # Try to extract code from markdown blocks
-        import re
-        code_match = re.search(r"```python\n(.*?)```", response, re.DOTALL)
-        if code_match:
-            code = code_match.group(1).strip()
-        else:
-            code_match = re.search(r"```(.*?)```", response, re.DOTALL)
-            if code_match:
-                code = code_match.group(1).strip()
+        
+        # Extract JSON from response
+        try:
+            # Try to find JSON block
+            json_match = re.search(r"```json\n(.*?)```", response, re.DOTALL)
+            if json_match:
+                json_str = json_match.group(1)
             else:
-                # Fallback: assume the whole response is code, but strip backticks if any
-                code = response.replace("```python", "").replace("```", "").strip()
-        
-        return code
+                json_match = re.search(r"```(.*?)```", response, re.DOTALL)
+                if json_match:
+                    json_str = json_match.group(1)
+                else:
+                    json_str = response.strip()
+            
+            parsed = json.loads(json_str)
+            
+            # Handle case where LLM wraps list in a dict
+            if isinstance(parsed, dict):
+                # Check if it's a single step
+                if "function" in parsed:
+                    parsed = [parsed]
+                elif "steps" in parsed:
+                    parsed = parsed["steps"]
+                elif "plan" in parsed:
+                    parsed = parsed["plan"]
+                else:
+                    # Try to find any list value
+                    for v in parsed.values():
+                        if isinstance(v, list):
+                            parsed = v
+                            break
+            
+            if not isinstance(parsed, list):
+                print(f"Parsed JSON is not a list: {parsed}")
+                return []
+                
+            return parsed
+        except json.JSONDecodeError:
+            print(f"Failed to decode JSON: {response}")
+            return []
 
-    def execute_code(self, code: str):
-        """Executes the code in a local scope."""
-        local_scope = {"df": self.df, "pd": pd}
+    def execute_json_plan(self, plan: list):
+        """Executes the JSON plan."""
+        context = {"df": self.df}
+        execution_log = []
+        final_result = None
+        result = None
+        fig = None
         
-        # Add plotting libraries to scope
+        if not isinstance(plan, list):
+             return {
+                "success": False,
+                "error": f"Invalid plan format: expected list, got {type(plan)}",
+                "log": []
+            }
+        
         try:
             import matplotlib.pyplot as plt
             import seaborn as sns
-            local_scope["plt"] = plt
-            local_scope["sns"] = sns
         except ImportError:
             pass
 
-        # Capture stdout
-        old_stdout = sys.stdout
-        redirected_output = io.StringIO()
-        sys.stdout = redirected_output
+        for step in plan:
+            if not isinstance(step, dict):
+                execution_log.append({
+                    "status": "error",
+                    "error": f"Invalid step format: expected dict, got {type(step)}"
+                })
+                continue
+                
+            func_name = step.get("function")
+            args = step.get("args", {})
+            output_var = step.get("output")
+            
+            # Resolve variable references in args
+            resolved_args = {}
+            for k, v in args.items():
+                if isinstance(v, str) and v in context:
+                    resolved_args[k] = context[v]
+                else:
+                    resolved_args[k] = v
+            
+            try:
+                result = None
+                
+                
+                if func_name == "filter":
+                    df_in = resolved_args.get("dataframe", context["df"])
+                    col = resolved_args.get("column")
+                    op = resolved_args.get("operator")
+                    val = resolved_args.get("value")
+                    
+                    if op == "==": result = df_in[df_in[col] == val]
+                    elif op == "!=": result = df_in[df_in[col] != val]
+                    elif op == ">": result = df_in[df_in[col] > val]
+                    elif op == "<": result = df_in[df_in[col] < val]
+                    elif op == ">=": result = df_in[df_in[col] >= val]
+                    elif op == "<=": result = df_in[df_in[col] <= val]
+                    elif op == "contains": result = df_in[df_in[col].astype(str).str.contains(str(val), case=False, na=False)]
+                
+                elif func_name == "sort":
+                    df_in = resolved_args.get("dataframe", context["df"])
+                    col = resolved_args.get("column")
+                    asc = resolved_args.get("ascending", True)
+                    result = df_in.sort_values(by=col, ascending=asc)
+                
+                elif func_name == "group_by":
+                    df_in = resolved_args.get("dataframe", context["df"])
+                    by = resolved_args.get("by")
+                    agg_col = resolved_args.get("agg_col")
+                    agg_func = resolved_args.get("agg_func")
+                    
+                    # Perform groupby
+                    grouped = df_in.groupby(by)[agg_col].agg(agg_func)
+                    
+                    # If result is a Series (single agg column), rename it to avoid collision on reset_index
+                    if isinstance(grouped, pd.Series):
+                        if grouped.name == by:
+                            grouped.name = f"{agg_col}_{agg_func}"
+                    
+                    result = grouped.reset_index()
+                
+                elif func_name == "calculate":
+                    df_in = resolved_args.get("dataframe", context["df"])
+                    col = resolved_args.get("column")
+                    func = resolved_args.get("func")
+                    series = df_in[col]
+                    if func == "mean": result = series.mean()
+                    elif func == "sum": result = series.sum()
+                    elif func == "min": result = series.min()
+                    elif func == "max": result = series.max()
+                    elif func == "count": result = series.count()
+                    elif func == "unique": result = series.unique()
+                    elif func == "value_counts": result = series.value_counts()
+                
+                elif func_name == "select_columns":
+                    df_in = resolved_args.get("dataframe", context["df"])
+                    cols = resolved_args.get("columns")
+                    result = df_in[cols]
+                
+                elif func_name == "head":
+                    df_in = resolved_args.get("dataframe", context["df"])
+                    n = int(resolved_args.get("n", 5))
+                    result = df_in.head(n)
+                
+                elif func_name == "plot":
+                    df_in = resolved_args.get("dataframe", context["df"])
+                    x = resolved_args.get("x")
+                    y = resolved_args.get("y")
+                    kind = resolved_args.get("kind", "bar")
+                    title = resolved_args.get("title", f"{kind} plot of {y} by {x}")
+                    
+                    plt.figure(figsize=(10, 6))
+                    if kind == "bar":
+                        sns.barplot(data=df_in, x=x, y=y)
+                    elif kind == "line":
+                        sns.lineplot(data=df_in, x=x, y=y)
+                    elif kind == "scatter":
+                        sns.scatterplot(data=df_in, x=x, y=y)
+                    elif kind == "hist":
+                        sns.histplot(data=df_in, x=x)
+                    elif kind == "box":
+                        sns.boxplot(data=df_in, x=x, y=y)
+                    
+                    plt.title(title)
+                    plt.xticks(rotation=45)
+                    fig = plt.gcf()
+                    result = "Plot generated"
 
-        try:
-            print("burada")
-            import ast
-            tree = ast.parse(code)
-            last_stmt = tree.body[-1] if tree.body else None
-            
-            # If the last statement is an expression, we want to return its value
-            if isinstance(last_stmt, ast.Expr):
-                # Execute everything before the last expression
-                exec(compile(ast.Module(body=tree.body[:-1], type_ignores=[]), filename="<string>", mode="exec"), {}, local_scope)
-                # Evaluate the last expression
-                result = eval(compile(ast.Expression(body=last_stmt.value), filename="<string>", mode="eval"), {}, local_scope)
-                local_scope["result"] = result
-            else:
-                # Just execute the whole thing
-                exec(code, {}, local_scope)
-                result = local_scope.get("result", None)
-                print(result)
-            sys.stdout = old_stdout
-            output = redirected_output.getvalue()
-            
-            fig = local_scope.get("fig", None)
-            
-            # If no explicit result variable, but there is stdout, use that
-            if result is None and output:
-                result = output
-            
-            return {
-                "success": True,
-                "result": result,
-                "output": output,
-                "fig": fig
-            }
-        except Exception as e:
-            sys.stdout = old_stdout
-            return {
-                "success": False,
-                "error": str(e),
-                "traceback": traceback.format_exc()
-            }
+                else:
+                    raise ValueError(f"Unknown function: {func_name}")
+
+                # Store result
+                if output_var:
+                    context[output_var] = result
+                    if output_var == "final_result":
+                        final_result = result
+                
+                execution_log.append({
+                    "step_id": step.get("id"),
+                    "status": "success",
+                    "result_preview": str(result)[:100]
+                })
+
+            except Exception as e:
+                execution_log.append({
+                    "step_id": step.get("id"),
+                    "status": "error",
+                    "error": str(e)
+                })
+                return {
+                    "success": False,
+                    "error": str(e),
+                    "log": execution_log
+                }
+
+        return {
+            "success": True,
+            "result": final_result if final_result is not None else result, # Fallback to last result
+            "log": execution_log,
+            "fig": fig
+        }
 
     def explain_result(self, user_query: str, execution_result: dict) -> str:
         """Explains the result to the user."""
-        result_preview = str(execution_result.get("result"))[:500] # Truncate for token limit
+        result_preview = str(execution_result.get("result"))[:500]
         
         prompt = f"""
         User Query: {user_query}
